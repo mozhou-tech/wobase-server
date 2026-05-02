@@ -78,6 +78,15 @@ CREATE INDEX idx_wallet_transactions_user_created ON wallet_transactions(user_id
 CREATE INDEX idx_user_vips_user_app_env_status ON user_vips(user_id, app_id, env, status) WHERE status = 'active';
 CREATE INDEX idx_user_vips_end_at ON user_vips(end_at) WHERE status = 'active';
 
+-- 团队席位制 VIP（启用该模块时创建）
+CREATE INDEX idx_team_vip_subs_team_app_env ON team_vip_subscriptions(team_id, app_id, env);
+CREATE INDEX idx_team_vip_subs_active_window ON team_vip_subscriptions(app_id, env, end_at)
+  WHERE status = 'active';
+CREATE INDEX idx_team_vip_seats_sub_active ON team_vip_seat_assignments(subscription_id)
+  WHERE status = 'active';
+CREATE INDEX idx_team_vip_seats_user_app_env ON team_vip_seat_assignments(user_id, app_id, env)
+  WHERE status = 'active';
+
 -- RBAC 查询
 CREATE INDEX idx_user_roles_user_app_env ON user_roles(user_id, app_id, env);
 CREATE INDEX idx_role_permissions_role ON role_permissions(role_id);
@@ -178,6 +187,46 @@ $$;
 >
 > **非 active 成员**：`banned` / `deleted` 不满足上述 `WHERE`，函数返回 **NULL**（调用方勿把 NULL 当成 `basic`）；RLS 与档位判断应以「成员存在且 `active`」为前提。
 
+### 档位写回：`recompute_app_user_tier`（强烈推荐）
+
+`effective_user_tier` 仅 **读取** `app_users` 已落库的枚举；**团队席位 + 个人 VIP** 并存时，`user_tier` / `tier_expires_at` 的权威来源是多张业务表，应在单一 **`SECURITY DEFINER`** 函数内合成并 **写回 `app_users`**，避免 Edge 与 Cron 各写一套逻辑。
+
+**签名（示意，表就绪后在 migrations 中创建）**
+
+```text
+recompute_app_user_tier(
+  p_app_id uuid,
+  p_env text,
+  p_user_id uuid,
+  p_reason text DEFAULT NULL,
+  p_operator_user_id uuid DEFAULT NULL
+) RETURNS void
+```
+
+**语义**
+
+1. 若不存在 `app_users(app_id, env, user_id)` 或 **`app_user_status <> 'active'`**，直接 **RETURN**（不写删档用户）。
+2. **`v_team_exp`**：`team_vip_seat_assignments.status = 'active'` 且关联 **`team_vip_subscriptions`** 满足 `subscriptions.status = 'active'` 且 `now()` 落在 `[start_at, end_at]`（边界开合按产品约定），取 **`MAX(subscriptions.end_at)`**。
+3. **`v_paid_exp`**：`user_vips.status = 'active'` 且 `end_at > now()`，取 **`MAX(end_at)`**（与个人多条 VIP 约定一致）。
+4. **默认优先级**（与 VIP 小节「`paid` 与 `team` 并存」一致）：若 `v_team_exp IS NOT NULL` → `user_tier = 'team'`，`tier_expires_at = v_team_exp`；否则若 `v_paid_exp IS NOT NULL` → **`paid`** / **`v_paid_exp`**；否则 **`basic`** / **`tier_expires_at = NULL`**。
+5. 若 `(user_tier, tier_expires_at)` 与当前行 **任一变化**，在同一事务内 **`UPDATE app_users`**，并 **`INSERT user_tier_change_logs`**（`from_*` / `to_*`、`reason` 可用 `p_reason` 或细分枚举）。
+6. **JWT**：若项目依赖 `app_metadata.tier` 镜像，须在调用链末端（Edge Admin API）触发刷新；数据库函数本身不刷新 JWT。
+
+**并发**：可被多条 Edge 路径并发调用；以 **`UPDATE app_users WHERE ...`** 单行更新为主，幂等（重复计算得到相同结果则无日志）。
+
+**权限**：`REVOKE ALL ON FUNCTION recompute_app_user_tier(...) FROM PUBLIC`；仅 **`service_role`** 或 **`postgres`**（含 Edge 使用的服务端连接）具备 `EXECUTE`。客户端禁止直连调用。
+
+**调用时机（备忘）**
+
+| 触发场景 | 调用方 |
+|---------|--------|
+| 分配 / 撤销席位、订阅生效或解约 | Edge（席位事务末尾） |
+| `user_vips` 开通 / 退款 / 过期回调 | Edge |
+| 批量订阅到期 Cron | 对每个受影响 `user_id` 调用（或由 SQL 批量 `SELECT DISTINCT user_id ...` 循环） |
+| 定时降级任务 | **优先**对本函数扫描出的候选用户调用，而不是仅 `UPDATE ... SET basic` 一刀切（否则团队过期后仍可能有有效 **paid**） |
+
+产品若启用 **`paid` 优先于 `team`**，在本函数内 **调换分支顺序** 即可，并保持 VIP 小节表格与代码同步。
+
 ## 应用元数据与扩展
 
 ### 核心设计目标
@@ -258,17 +307,31 @@ CREATE TRIGGER update_mygame_player_levels_updated_at
 -- 启用 RLS
 ALTER TABLE mygame_player_levels ENABLE ROW LEVEL SECURITY;
 
--- 策略 1：用户只能读写自己的记录（且 env 匹配）
+-- 策略 1：用户只能读写自己的记录（env + active 成员关系，与通用模板一致）
 CREATE POLICY "mygame_player_levels_self_access"
   ON mygame_player_levels
   FOR ALL
   USING (
     user_id = auth.uid()
     AND env = (auth.jwt()->'app_metadata'->>'env')
+    AND EXISTS (
+      SELECT 1 FROM app_users au
+      WHERE au.app_id = mygame_player_levels.app_id
+        AND au.env = mygame_player_levels.env
+        AND au.user_id = auth.uid()
+        AND au.app_user_status = 'active'
+    )
   )
   WITH CHECK (
     user_id = auth.uid()
     AND env = (auth.jwt()->'app_metadata'->>'env')
+    AND EXISTS (
+      SELECT 1 FROM app_users au
+      WHERE au.app_id = mygame_player_levels.app_id
+        AND au.env = mygame_player_levels.env
+        AND au.user_id = auth.uid()
+        AND au.app_user_status = 'active'
+    )
   );
 
 -- 策略 2：管理员可按应用查询（RBAC；生产建议链到 permissions，见「管理员 RLS 与 permissions」）
@@ -684,6 +747,7 @@ $$;
 - `price` (numeric(18,2))
 - `duration_days` (int)
 - `benefits` (jsonb)
+- （可选）`billing_model` (text) — `individual` | `team_seats`，建议 `CHECK (billing_model IN ('individual','team_seats'))`；`team_seats` 表示按 **席位池** 售卖给团队 / 组织（见下文「团队席位制 VIP」）；默认可与个人套餐混存在同一 `vip_plans` 表中
 - `status` (text) — `active` | `inactive`，`CHECK (status IN ('active','inactive'))`
 
 > `vip_plans` 通常作为配置表，**不建议**物理删除已创建套餐（避免已售记录悬空）。如需停用，标记 `status = 'inactive'`。
@@ -706,9 +770,133 @@ $$;
 - 按应用隔离 VIP 体系
 - 权益配置可通过 `benefits` 动态扩展
 
+### 团队 / 组织席位制 VIP
+
+面向「组织统一付费、限制并发成员数（席位）」的套餐：**售卖单元**是「某团队在订阅期内可用的席位上限」，成员只有通过 **席位分配** 才享有团队档权益；与个人 `user_vips`（按人一条开通记录）并行存在。
+
+#### 概念关系
+
+| 对象 | 作用 |
+|------|------|
+| `teams` | 组织载体（已有约定：`app_id`、`env`） |
+| `vip_plans`（`billing_model = 'team_seats'`） | 定价与权益模板（含可选默认席位参考，最终以订阅为准） |
+| `team_vip_subscriptions` | **成交实体**：某团队购买了哪个套餐、共多少个席位、起止时间与支付幂等 |
+| `team_vip_seat_assignments` | **席位占用**：哪个用户占用一席（有效期内计入席位计数） |
+| `app_users.user_tier` / `tier_expires_at` | 被分配席位的成员同步为 **`team`**，到期时间与订阅对齐，便于沿用现有 RLS「有效档位」表达式 |
+
+不要求每个占席用户再写一行 `user_vips`（可选镜像写入便于报表，但 **授权仍以「订阅有效 + 席位分配有效」为准**，避免双源不一致）。
+
+#### 核心表（建议在 migrations 中落地）
+
+`team_vip_subscriptions`
+
+- `id` (uuid, pk)
+- `app_id` (uuid, fk -> apps.id, `ON DELETE CASCADE`)
+- `env` (text) — `CHECK (env IN ('dev','test','prod'))`
+- `team_id` (uuid, fk -> teams.id, `ON DELETE CASCADE` 或 `RESTRICT`，按是否在解散团队时保留订阅审计选择)
+- `plan_id` (uuid, fk -> vip_plans.id, `ON DELETE RESTRICT`)
+- `seat_limit` (int) — **席位上限**，`CHECK (seat_limit > 0)`
+- `start_at` / `end_at` (timestamptz) — 订阅生效区间；可与 `vip_plans.duration_days` 在开通时换算写入
+- `status` (text) — `active` | `expired` | `cancelled`，`CHECK (...)`
+- `biz_no` (text, nullable) — 支付 / 签约幂等键；建议 **`unique(app_id, env, biz_no)`**（与钱包等业务单号体系一致时可共用前缀区分）
+- `metadata` (jsonb, default '{}')
+- `created_at` (timestamptz)
+
+`team_vip_seat_assignments`
+
+- `id` (uuid, pk)
+- `app_id` (uuid, fk -> apps.id, `ON DELETE CASCADE`)
+- `env` (text) — `CHECK (env IN ('dev','test','prod'))`
+- `subscription_id` (uuid, fk -> team_vip_subscriptions.id, `ON DELETE CASCADE`)
+- `user_id` (uuid, fk -> auth.users.id, `ON DELETE CASCADE`)
+- `status` (text) — `active` | `revoked`，`CHECK (status IN ('active','revoked'))`
+- `assigned_at` (timestamptz)
+- `revoked_at` (timestamptz, nullable)
+- `assigned_by_user_id` (uuid, nullable) — 管理员或团队管理员
+- `created_at` (timestamptz)
+
+**约束与计数**
+
+- **同一订阅下同一人仅一条有效占席**：`CREATE UNIQUE INDEX ... ON team_vip_seat_assignments(subscription_id, user_id) WHERE status = 'active';`
+- **占席总数不超过 `seat_limit`**：须在 **`SECURITY DEFINER` 函数或 Edge Function** 内 `SELECT ... FOR UPDATE` 锁定 `team_vip_subscriptions` 行后，统计 `status = 'active'` 条数再允许插入 / 激活；禁止仅靠客户端校验。
+- 订阅 `status != 'active'` 或 `now()` 不在 `[start_at, end_at]` 内时，不得新增有效占席；已有占席应按规则 **撤销或批量降级**（见下）。
+
+#### 与 `app_users` 同步（推荐）
+
+席位 **生效**（`assignment.status = 'active'` 且订阅有效）时，在同一事务内更新对应用户在 `(app_id, env)` 下的：
+
+- `user_tier = 'team'`
+- `tier_expires_at = subscription.end_at`（或团队单独策略；若允许多段订阅叠加需另行定义优先级）
+
+席位 **撤销** 或 **订阅到期 / 解约**：
+
+- 将该用户在该 `(app_id, env)` 下 **不再存在任何有效团队席位** 时，`user_tier` 降为 `basic`，`tier_expires_at` 清空（或与仍有效的个人 `paid` VIP 对齐，由业务规则决定优先级）。
+- 所有批量变更写入 **`user_tier_change_logs`**，`reason` 可使用 `team_seat_revoke`、`team_subscription_expire` 等扩展枚举。
+
+定时任务除扫描 `app_users.tier_expires_at` 外，应扫描 **`team_vip_subscriptions.end_at`**，批量失效订阅并触发占席清理与档位同步。
+
+#### RLS 要点
+
+- `team_vip_subscriptions`：**团队管理员或具备财务/VIP 权限的运营角色**可读写在对应 `app_id` + `env`；普通成员通常仅可读与本团队相关的摘要（按需裁剪列）。
+- `team_vip_seat_assignments`：成员可读 **与自己有关** 的行；管理员可读团队内分配列表。
+- **团队资源表**（带 `team_id`）：策略仍为「团队成员 **且**（个人有效 `team` 档 **或** 占席有效 —— 二者若等价同步到 `app_users` 则可继续仅用 `effective_user_tier` / `exists app_users`）」；避免仅信任 JWT。
+
+索引（`team_vip_*`）见上文 **「索引与性能设计」** 中与 VIP 并列的段落；启用席位模块时在 migrations 中一并创建。
+
+#### 服务端职责（Edge Functions）
+
+- 开通 / 续费 / 解约团队订阅（支付回调幂等、`biz_no`）
+- **分配席位 / 撤销席位**（强制席位上限与订阅窗口校验）
+- 订阅到期批量撤销占席并刷新 `app_users`
+- **档位合成**：与个人 `paid` / `user_vips` 叠加时执行下文「`paid` 与 `team` 并存」规则；所有写入 `app_users` 的路径收口到少量 Edge / DB 函数，避免分叉逻辑
+
+#### 团队解散与 `teams` 外键策略
+
+| `team_vip_subscriptions.team_id` → `teams.id` | 适用场景 |
+|-----------------------------------------------|---------|
+| **`ON DELETE RESTRICT`（推荐默认）** | 存在任意 **未归档** 订阅（尤其 `status = 'active'`）时 **禁止删除团队**，必须先解约、作废订阅或整体退款流程结束；利于财务审计不断档 |
+| **`ON DELETE CASCADE`** | 团队物理删除即带走订阅与占席；实现简单但 **订阅与回款审计链断裂**，仅适合强确信「团队即租户」且无合规留存 |
+| **团队仅软删**（`teams.status = 'deleted'` + RLS 禁止新业务） | 与 RESTRICT 组合最佳：业务上「解散」不删主键行，订阅自然到期或与法务流程对齐后再归档 |
+
+**占席侧**：`subscription_id` → `team_vip_subscriptions` 常用 **`ON DELETE CASCADE`**（删除订阅则分配一并清理）；若需永久保留分配历史审计，可改为 `ON DELETE RESTRICT`，仅以订阅 **`status`** 作废而非物理删除订阅行。
+
+#### `paid` 个人 VIP 与 `team` 席位并存（推荐默认）
+
+`app_users.user_tier` 为 **单一枚举**，建议在 Edge / `SECURITY DEFINER` **统一合成函数**内按下表刷新（任意订阅变更、VIP 变更、撤销席位后调用）：
+
+| 有效来源（同一 `app_id` + `env`） | `user_tier` | `tier_expires_at` |
+|----------------------------------|-------------|-------------------|
+| 仅有有效团队占席 + 订阅窗口内 | `team` | 对应 **`team_vip_subscriptions.end_at`**（多订阅并存时取 **最远 `end_at`** 或拒绝重叠，见下） |
+| 无团队占席，但有有效个人 `user_vips`（`paid` 语义） | `paid` | 个人 VIP **`end_at`**（多条取最远或与业务约定一致） |
+| 两者皆无 | `basic` | `NULL` |
+| **两者兼有（默认产品策略）** | **`team`** | **`team` 订阅的 `end_at`**（协作档优先）；个人付费独享能力仍可通过 **`user_vips` / `benefits`** 在 **RLS 或单独布尔/配额字段** 中叠加判断，避免单靠 `user_tier` 表达交集 |
+
+若产品要求「个人付费权益始终覆盖团队包装」，可改为 **`paid` 优先**，但须在全文与前台文案中固定一种顺序，**禁止**客户端本地推断。**写回 `app_users` 的实现须集中在 `recompute_app_user_tier`**（见「数据库基础设施函数」），并在该函数内调换 `team` / `paid` 分支顺序与文档保持一致。
+
+**同一用户多条 active 团队订阅**：须在业务层约束「同一 `(user_id, app_id, env)` 最多一条 active `team_vip_seat_assignments`」，或允许多条但 **`tier_expires_at = max(相关订阅.end_at)`** 并由定时任务与 RLS 一致收敛。
+
+#### 席位分配原子流程（提纲）
+
+单席位分配须在 **同一事务** 内完成：
+
+1. `SELECT ... FROM team_vip_subscriptions WHERE id = $1 FOR UPDATE`
+2. 校验 `status = 'active'` 且 `now()` ∈ `[start_at, end_at]`（边界语义产品自定）
+3. `SELECT COUNT(*) FROM team_vip_seat_assignments WHERE subscription_id = $1 AND status = 'active'`（可加 `FOR UPDATE` 依赖父行锁序列化）
+4. 若 `count >= seat_limit` → 拒绝；否则 `INSERT` 分配（或 revive）并调用 **`recompute_app_user_tier(app_id, env, user_id, ...)`**（见「数据库基础设施函数」）
+5. 写入审计（`user_tier_change_logs` 可由合成函数一并写入）
+
+重复提交同一 `(subscription_id, user_id)`：依赖 **部分唯一索引** 或由 Edge **幂等键**（如 `assignment_client_token`）短路。
+
+#### 迁移脚本命名（通用模块）
+
+团队席位相关 DDL 属于**跨应用公共模块**，建议文件名与设计文档一致，不做 `ext_schema_prefix` 前缀：
+
+- 示例：`YYYYMMDDHHMM_team_vip_subscriptions.sql`、`YYYYMMDDHHMM_team_vip_seat_assignments.sql`
+- `teams` / `team_memberships` 若与本模块同批次引入，可使用 `YYYYMMDDHHMM_teams_core.sql`
+
 ## 用户级别（基础 / 付费 / 团队会员）
 
-面向终端用户的产品档位，用于区分默认能力、配额与部分资源的可见/可写范围；与 **VIP 套餐**（`vip_plans` / `user_vips`）可关联：`user_tier` 可由当前有效 VIP、订阅状态或运营策略计算得出。
+面向终端用户的产品档位，用于区分默认能力、配额与部分资源的可见/可写范围；与 **VIP 套餐**（`vip_plans`、个人 `user_vips`、以及可选 **团队席位制** `team_vip_subscriptions` / `team_vip_seat_assignments`）可关联：`user_tier` 可由当前有效 VIP、有效团队席位、订阅状态或运营策略计算得出。
 
 ### 档位语义（建议）
 
@@ -720,10 +908,10 @@ $$;
 
 ### 存储位置
 
-- **权威数据源（推荐）**：`app_users.user_tier`（已含 `app_id` + `env`），支付确认、套餐变更、团队绑定等事务内更新；RLS 策略通过 **JOIN `app_users` 或 `exists` 子查询** 读取当前用户的档位，避免仅凭 JWT 盲信。
+- **权威数据源（推荐）**：`app_users.user_tier`（已含 `app_id` + `env`），支付确认、套餐变更、团队绑定等事务内更新；复杂场景由 **`recompute_app_user_tier`** 统一写回（见「数据库基础设施函数」）。RLS 策略通过 **JOIN `app_users` 或 `exists` 子查询** 读取当前用户的档位，避免仅凭 JWT 盲信。
 - **JWT 自定义声明（加速路径）**：将档位镜像到 **`app_metadata`**（例如 `app_metadata.tier` 或与 `app_id`/`env` 组合的嵌套结构），便于策略中快速判断。**不得**使用 `user_metadata` 作为授权依据（用户可自改）。
   注意：JWT 可能滞后于数据库（例如刚付款未刷新 token），敏感操作仍应以 **库表为准** 或在业务层强制刷新会话。
-- **复杂场景**：团队席位、多子账号时，可增设 **团队表 + 成员表**（见下文级联删除），RLS 用 `exists` 关联团队与资源上的 `team_id`。
+- **复杂场景**：团队席位制 VIP（`team_vip_subscriptions` / `team_vip_seat_assignments`）、团队基础模型 **团队表 + 成员表**（见「团队数据模型与级联」），RLS 用 `exists` 关联团队与资源上的 `team_id`。
 - **到期降级**：`tier_expires_at` 到期后，`user_tier` 应收敛为 `basic`（或由定时任务/触发器/Edge Function 批量修正）；**授权判定**优先在 RLS/函数中使用「当前时间相对 `tier_expires_at`」的有效档位表达式，避免仅读 `user_tier` 字段而忽略过期。
 
 ### 到期降级落地机制
@@ -768,6 +956,8 @@ $$;
        AND tier_expires_at <= now()
    $$);
    ```
+   上述语句为**兜底**：用户仍可能持有有效 **paid**（仅团队订阅过期）时被误降为 `basic`。**推荐**改为：Cron / Edge 列出「`tier_expires_at` 已过但仍可能叠加 VIP」的 `user_id`，对每个 **`recompute_app_user_tier(app_id, env, user_id, 'cron_tier_fix')`**；仅在确认无席位模块且无个人 VIP 的最简产品中保留纯 `UPDATE basic`。
+
    每次降级必须同步写入 `user_tier_change_logs`。
 
 3. **可选：封装复用函数**
@@ -817,7 +1007,7 @@ $$;
 - `teams`：`id`, `app_id`, `env`, …
 - `team_memberships`：`team_id` → `teams(id)` **`ON DELETE CASCADE`**，`user_id`, `role_in_team`, …
 
-删除团队行时，数据库自动删除所有成员关联，避免悬空成员仍通过旧 `team_id` 访问资源；RLS 仍应绑定「成员存在且团队未删除」。
+删除团队行时，数据库自动删除所有成员关联，避免悬空成员仍通过旧 `team_id` 访问资源；RLS 仍应绑定「成员存在且团队未删除」。若已启用 **团队席位制 VIP**，`team_vip_subscriptions` 与 `teams` 的外键及「解散 / 删团队」顺序见上文 VIP 小节 **「团队解散与 `teams` 外键策略」**。
 
 ### 档位变更审计（纠纷与合规）
 
@@ -826,7 +1016,7 @@ $$;
 - `id`, `app_id`, `env`, `user_id`
 - `from_tier`, `to_tier`
 - `from_expires_at`, `to_expires_at`（可选，便于核对订阅周期）
-- `reason` (text) — `purchase_expire` | `admin_adjust` | `refund` | `team_dissolve` 等
+- `reason` (text) — `purchase_expire` | `admin_adjust` | `refund` | `team_dissolve` | `team_seat_revoke` | `team_subscription_expire` 等
 - `operator_user_id` (uuid, nullable) — 系统自动可为 null
 - `created_at` (timestamptz)
 
@@ -1029,14 +1219,14 @@ SELECT count(*) FROM wallet_transactions WHERE app_id = 'app-uuid';
 - 服务端（Edge Functions）：
   - 支付回调验签
   - 批量结算与对账
-  - 管理后台高权限操作（封禁、调账、授予 VIP）
+  - 管理后台高权限操作（封禁、调账、授予 VIP、**团队席位分配与订阅管理**）
 
 ## 管理后台建议菜单
 
 - 应用管理：应用列表、状态管理、应用配置
 - 用户管理：用户检索、封禁解禁、资料查看、行为日志
 - 财务管理：账户、流水、对账、提现审核
-- VIP 管理：套餐、开通记录、续费记录、过期处理
+- VIP 管理：套餐、开通记录、续费记录、过期处理；**团队席位**：订阅、席位上限、分配与回收
 - 权限管理：角色、权限点、人员授权
 - 档位审计：`user_tier_change_logs` 检索（纠纷 / 对账）
 
@@ -1121,5 +1311,5 @@ Supabase 的连接池有限：
 - 实时通知（Realtime，含安全订阅范围配置）
 - 财务报表与导出
 - 更细粒度权限（字段级、动作级）
-- 团队维度成员表与共享资源的 RLS 策略细化；团队删除级联与资源清理策略复核
+- 团队维度成员表与共享资源的 RLS 策略细化；团队删除级联与资源清理策略复核；**团队席位制 VIP**（订阅、分配、到期同步 `app_users`）
 - `tier_expires_at` 到期降级任务（pg_cron / Edge Function Cron）与审计完整性
