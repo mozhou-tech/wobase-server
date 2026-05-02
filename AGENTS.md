@@ -14,6 +14,7 @@
 
 - Supabase Auth：用户认证（邮箱、手机号、OAuth 可选）
 - Supabase Postgres：核心业务数据
+- TimescaleDB（Postgres 扩展）：财务流水等时序数据的自动分区、压缩与保留策略
 - Supabase Storage：头像、票据、附件等文件
 - Supabase Realtime：订单状态、账户余额变更实时推送（可选）
 - Supabase Edge Functions：支付回调、账务结算、异步任务入口
@@ -94,6 +95,14 @@ CREATE INDEX idx_role_permissions_role ON role_permissions(role_id);
 -- 审计日志
 CREATE INDEX idx_user_status_logs_user_app ON user_status_logs(user_id, app_id, created_at DESC);
 CREATE INDEX idx_user_tier_logs_user_app ON user_tier_change_logs(user_id, app_id, env, created_at DESC);
+
+-- 团队基础模型（配合团队成员查询）
+CREATE INDEX idx_teams_app_env ON teams(app_id, env);
+CREATE INDEX idx_teams_owner ON teams(owner_user_id);
+CREATE INDEX idx_team_memberships_user_app_env ON team_memberships(user_id, app_id, env)
+  WHERE status = 'active';
+CREATE INDEX idx_team_memberships_team ON team_memberships(team_id)
+  WHERE status = 'active';
 ```
 
 > 注意：`unique` 约束会自动创建唯一索引，无需额外声明。
@@ -217,6 +226,108 @@ recompute_app_user_tier(
 **并发**：可被多条 Edge 路径并发调用；以 **`UPDATE app_users WHERE ...`** 单行更新为主，幂等（重复计算得到相同结果则无日志）。
 
 **权限**：`REVOKE ALL ON FUNCTION recompute_app_user_tier(...) FROM PUBLIC`；仅 **`service_role`** 或 **`postgres`**（含 Edge 使用的服务端连接）具备 `EXECUTE`。客户端禁止直连调用。
+
+**完整实现（参考）**
+
+```sql
+CREATE OR REPLACE FUNCTION recompute_app_user_tier(
+  p_app_id uuid,
+  p_env text,
+  p_user_id uuid,
+  p_reason text DEFAULT NULL,
+  p_operator_user_id uuid DEFAULT NULL
+) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_current_tier text;
+  v_current_expires timestamptz;
+  v_team_exp timestamptz;
+  v_paid_exp timestamptz;
+  v_new_tier text;
+  v_new_expires timestamptz;
+BEGIN
+  -- 0. 成员不存在或非 active，不操作
+  SELECT user_tier, tier_expires_at
+  INTO v_current_tier, v_current_expires
+  FROM app_users
+  WHERE app_id = p_app_id
+    AND env = p_env
+    AND user_id = p_user_id
+    AND app_user_status = 'active'
+  FOR UPDATE;
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  -- 1. 团队席位：取当前有效占席中最远到期时间
+  SELECT MAX(sub.end_at) INTO v_team_exp
+  FROM team_vip_seat_assignments tsa
+  JOIN team_vip_subscriptions sub
+    ON sub.id = tsa.subscription_id
+   AND sub.app_id = p_app_id
+   AND sub.env = p_env
+   AND sub.status = 'active'
+   AND sub.start_at <= now()
+   AND (sub.end_at IS NULL OR sub.end_at > now())
+  WHERE tsa.app_id = p_app_id
+    AND tsa.env = p_env
+    AND tsa.user_id = p_user_id
+    AND tsa.status = 'active';
+
+  -- 2. 个人 VIP：取当前有效记录中最远到期时间
+  SELECT MAX(end_at) INTO v_paid_exp
+  FROM user_vips
+  WHERE app_id = p_app_id
+    AND env = p_env
+    AND user_id = p_user_id
+    AND status = 'active'
+    AND end_at > now();
+
+  -- 3. 优先级合成（默认 team 优先；付费优先则调换分支）
+  IF v_team_exp IS NOT NULL THEN
+    v_new_tier := 'team';
+    v_new_expires := v_team_exp;
+  ELSIF v_paid_exp IS NOT NULL THEN
+    v_new_tier := 'paid';
+    v_new_expires := v_paid_exp;
+  ELSE
+    v_new_tier := 'basic';
+    v_new_expires := NULL;
+  END IF;
+
+  -- 4. 无变化则跳过（幂等）
+  IF v_new_tier IS NOT DISTINCT FROM v_current_tier
+     AND v_new_expires IS NOT DISTINCT FROM v_current_expires THEN
+    RETURN;
+  END IF;
+
+  -- 5. 写入 app_users
+  UPDATE app_users
+  SET user_tier = v_new_tier,
+      tier_expires_at = v_new_expires
+  WHERE app_id = p_app_id
+    AND env = p_env
+    AND user_id = p_user_id;
+
+  -- 6. 审计日志
+  INSERT INTO user_tier_change_logs (
+    app_id, env, user_id,
+    old_tier, new_tier,
+    old_expires_at, new_expires_at,
+    reason, operator_user_id
+  ) VALUES (
+    p_app_id, p_env, p_user_id,
+    v_current_tier, v_new_tier,
+    v_current_expires, v_new_expires,
+    p_reason, p_operator_user_id
+  );
+END;
+$$;
+
+REVOKE ALL ON FUNCTION recompute_app_user_tier(uuid, text, uuid, text, uuid) FROM PUBLIC;
+```
 
 **调用时机（备忘）**
 
@@ -416,6 +527,68 @@ CREATE POLICY "{table}_admin_access"
   );
 ```
 
+#### 3-b) 团队资源 RLS 策略模板
+
+当业务表包含 `team_id` 字段（如团队共享文档、文件夹等）时，使用以下模板：
+
+```sql
+-- 团队成员可读写团队资源
+CREATE POLICY "{table}_team_member_access"
+  ON {table}
+  FOR ALL
+  USING (
+    (auth.jwt()->'app_metadata'->>'env') IS NOT NULL
+    AND (auth.jwt()->'app_metadata'->>'env') IN ('dev', 'test', 'prod')
+    AND env = (auth.jwt()->'app_metadata'->>'env')
+    -- 当前用户是团队成员（active 且团队未被软删除）
+    AND EXISTS (
+      SELECT 1 FROM team_memberships tm
+      JOIN teams t ON t.id = tm.team_id
+      WHERE tm.team_id = {table}.team_id
+        AND tm.user_id = auth.uid()
+        AND tm.status = 'active'
+        AND t.status != 'deleted'
+    )
+    -- 可选：限制仅特定角色可写（如 admin/owner）
+    AND (
+      auth.uid() = {table}.created_by
+      OR EXISTS (
+        SELECT 1 FROM team_memberships tm
+        WHERE tm.team_id = {table}.team_id
+          AND tm.user_id = auth.uid()
+          AND tm.status = 'active'
+          AND tm.role_in_team IN ('owner', 'admin')
+      )
+    )
+  )
+  WITH CHECK (
+    (auth.jwt()->'app_metadata'->>'env') IS NOT NULL
+    AND (auth.jwt()->'app_metadata'->>'env') IN ('dev', 'test', 'prod')
+    AND env = (auth.jwt()->'app_metadata'->>'env')
+    AND team_id IS NOT NULL
+    AND EXISTS (
+      SELECT 1 FROM team_memberships tm
+      JOIN teams t ON t.id = tm.team_id
+      WHERE tm.team_id = {table}.team_id
+        AND tm.user_id = auth.uid()
+        AND tm.status = 'active'
+        AND t.status != 'deleted'
+    )
+    AND (
+      auth.uid() = {table}.created_by
+      OR EXISTS (
+        SELECT 1 FROM team_memberships tm
+        WHERE tm.team_id = {table}.team_id
+          AND tm.user_id = auth.uid()
+          AND tm.status = 'active'
+          AND tm.role_in_team IN ('owner', 'admin')
+      )
+    )
+  );
+```
+
+> **说明**：团队资源策略需同时校验 `team_memberships.status = 'active'` 和 `teams.status != 'deleted'`（软删的团队禁止任何成员访问）。若需要团队档位校验（仅 `team` tier 可访问），可在 `USING` 中叠加 `AND EXISTS (SELECT 1 FROM app_users au WHERE au.user_id = auth.uid() AND au.app_id = {table}.app_id AND au.env = {table}.env AND au.app_user_status = 'active' AND au.user_tier = 'team' AND (au.tier_expires_at IS NULL OR au.tier_expires_at > now()))`。
+
 #### 4) 应用层对接规范
 
 客户端调用时应始终携带当前应用标识，推荐方式：
@@ -550,6 +723,137 @@ CREATE POLICY "app_user_metadata_self"
 应用特有业务表：
 - 必须遵循 `app_id` + `env` + 资源归属的 RLS 约束
 - 建议通过 `apps.ext_schema_prefix` 在文档中记录各应用的扩展表清单，便于权限审计
+
+### 发票管理模块
+
+面向企业用户或个人报销场景，提供发票申请、开具、邮寄/电子交付的全流程管理。
+
+#### 核心表
+
+`invoice_applications`
+
+- `id` (uuid, pk)
+- `app_id` (uuid, fk -> apps.id, `ON DELETE CASCADE`)
+- `env` (text) — `dev`/`test`/`prod`，`CHECK (env IN ('dev','test','prod'))`
+- `user_id` (uuid, fk -> auth.users.id, `ON DELETE RESTRICT`)
+- `application_no` (text) — 申请单号，**唯一** `unique(app_id, env, application_no)`
+- `invoice_type` (text) — `vat_special`（增值税专用发票）| `vat_normal`（增值税普通发票）| `electronic`（电子发票），`CHECK (...)`
+- `title_type` (text) — `personal` | `enterprise`，`CHECK (...)`
+- `title_name` (text) — 发票抬头
+- `tax_no` (text, nullable) — 企业税号
+- `bank_name` (text, nullable) — 开户银行
+- `bank_account` (text, nullable) — 银行账号
+- `address` (text, nullable) — 注册地址
+- `phone` (text, nullable) — 注册电话
+- `email` (text, nullable) — 电子发票接收邮箱
+- `amount` (numeric(18,2)) — 开票金额，`CHECK (amount > 0)`
+- `status` (text) — `pending` | `approved` | `rejected` | `issued` | `mailed` | `completed`，`CHECK (...)`
+- `reject_reason` (text, nullable)
+- `operator_user_id` (uuid, nullable) — 审核/开票操作人
+- `issued_at` (timestamptz, nullable)
+- `invoice_no` (text, nullable) — 实际发票号码
+- `invoice_code` (text, nullable) — 发票代码
+- `pdf_url` (text, nullable) — 电子发票 PDF 链接
+- `tracking_no` (text, nullable) — 快递单号
+- `created_at` (timestamptz)
+- `updated_at` (timestamptz)
+
+`invoice_items`
+
+- `id` (uuid, pk)
+- `invoice_application_id` (uuid, fk -> invoice_applications.id, `ON DELETE CASCADE`)
+- `item_name` (text) — 项目名称（如「VIP 会员服务费」）
+- `specification` (text, nullable) — 规格型号
+- `unit` (text) — 单位（如「月」、「次」）
+- `quantity` (int) — 数量
+- `unit_price` (numeric(18,2)) — 单价
+- `amount` (numeric(18,2)) — 金额（= quantity * unit_price）
+- `tax_rate` (numeric(5,4)) — 税率（如 0.0600 表示 6%）
+- `tax_amount` (numeric(18,2)) — 税额
+- `created_at` (timestamptz)
+
+> **说明**：发票申请与钱包交易解耦，一张发票可包含多笔交易的合并开票，或一笔交易分拆多张发票。通过 `invoice_items` 记录明细，`amount` 汇总应等于 `invoice_applications.amount`。
+
+#### 索引
+
+```sql
+-- 用户查询自己的发票申请
+CREATE INDEX idx_invoice_apps_user_app_env ON invoice_applications(user_id, app_id, env);
+-- 按状态筛选（运营后台常用）
+CREATE INDEX idx_invoice_apps_status ON invoice_applications(app_id, env, status);
+-- 发票号码查询
+CREATE INDEX idx_invoice_apps_no ON invoice_applications(app_id, env, invoice_no);
+```
+
+#### 业务流程
+
+1. **申请**：用户填写抬头信息、选择开票类型、关联可开票的交易（或输入金额），创建 `pending` 申请
+2. **审核**：运营后台审核资质（企业用户校验税号），`status` → `approved` / `rejected`
+3. **开票**：调用税控接口或第三方开票服务，回填 `invoice_no`、`invoice_code`、`pdf_url`，`status` → `issued`
+4. **交付**：
+   - 电子发票：邮件发送 PDF，`status` → `completed`
+   - 纸质发票：打印并快递，回填 `tracking_no`，`status` → `mailed` → `completed`
+
+#### RLS 策略
+
+```sql
+-- 用户只能查看自己的发票申请
+CREATE POLICY "invoice_apps_user_read"
+  ON invoice_applications
+  FOR SELECT
+  USING (
+    (auth.jwt()->'app_metadata'->>'env') IS NOT NULL
+    AND (auth.jwt()->'app_metadata'->>'env') IN ('dev', 'test', 'prod')
+    AND env = (auth.jwt()->'app_metadata'->>'env')
+    AND user_id = auth.uid()
+  );
+
+-- 用户可创建发票申请（WITH CHECK 确保归属正确）
+CREATE POLICY "invoice_apps_user_insert"
+  ON invoice_applications
+  FOR INSERT
+  WITH CHECK (
+    (auth.jwt()->'app_metadata'->>'env') IS NOT NULL
+    AND (auth.jwt()->'app_metadata'->>'env') IN ('dev', 'test', 'prod')
+    AND env = (auth.jwt()->'app_metadata'->>'env')
+    AND user_id = auth.uid()
+    AND status = 'pending'
+  );
+
+-- 管理员可全操作（审核、开票、更新状态）
+CREATE POLICY "invoice_apps_admin_all"
+  ON invoice_applications
+  FOR ALL
+  USING (
+    (auth.jwt()->'app_metadata'->>'env') IS NOT NULL
+    AND (auth.jwt()->'app_metadata'->>'env') IN ('dev', 'test', 'prod')
+    AND env = (auth.jwt()->'app_metadata'->>'env')
+    AND EXISTS (
+      SELECT 1 FROM user_roles ur
+      JOIN role_permissions rp ON rp.role_id = ur.role_id
+      JOIN permissions perm ON perm.id = rp.permission_id
+      WHERE ur.user_id = auth.uid()
+        AND ur.app_id = invoice_applications.app_id
+        AND ur.env = invoice_applications.env
+        AND perm.code = 'invoice.manage'
+    )
+  );
+```
+
+#### Edge Function 接口
+
+| Edge Function | 方法 | 功能 | 调用方 |
+|---|---|---|---|
+| `apply_invoice` | POST | 提交发票申请 | 客户端 |
+| `audit_invoice` | POST | 审核发票申请（通过/驳回） | 管理后台 |
+| `issue_invoice` | POST | 完成开票（调用税控系统） | 管理后台/自动化 |
+| `send_invoice_email` | POST | 发送电子发票邮件 | 管理后台 |
+| `update_tracking` | POST | 更新快递单号 | 管理后台 |
+
+#### 与财务模块的关联
+
+- 开票成功后，应写入 `wallet_transactions` 记录一笔 `direction = 'out'`、`biz_type = 'invoice'` 的交易（如系统收取开票服务费）
+- 或在 `invoice_applications` 中关联原交易 ID，便于对账时追溯资金流向
 
 ## 环境与数据隔离（dev / test / prod）
 
@@ -729,6 +1033,12 @@ COMMIT;
 - `biz_no` (text) — 业务方唯一单号，用于幂等控制，**必须** `unique(app_id, env, biz_no)`
 - `ext` (jsonb)
 - `created_at` (timestamptz)
+
+> **TimescaleDB**：`wallet_transactions` 是核心时序数据表，建议在 migrations 中创建后立即转为 hypertable（见「运维与合规 → 数据归档策略」）。分割键 `created_at`，分区间隔 1 天。`unique(app_id, env, biz_no)` 约束需将 `created_at` 纳入以满足 TimescaleDB hypertable 的 UNIQUE 要求：
+> ```sql
+> UNIQUE(app_id, env, biz_no, created_at)
+> ```
+> 或在 Edge 层通过 `SELECT ... FOR UPDATE` + 应用幂等实现，不依赖唯一约束。
 
 ### 并发控制与余额安全
 
@@ -1123,10 +1433,50 @@ CREATE UNIQUE INDEX idx_team_vip_seats_unique_active
 
 ### 团队数据模型与级联（删除团队时清理成员）
 
-- `teams`：`id`, `app_id`, `env`, …
-- `team_memberships`：`team_id` → `teams(id)` **`ON DELETE CASCADE`**，`user_id`, `role_in_team`, …
+`teams`
 
-删除团队行时，数据库自动删除所有成员关联，避免悬空成员仍通过旧 `team_id` 访问资源；RLS 仍应绑定「成员存在且团队未删除」。若已启用 **团队席位制 VIP**，`team_vip_subscriptions` 与 `teams` 的外键及「解散 / 删团队」顺序见上文 VIP 小节 **「团队解散与 `teams` 外键策略」**。
+- `id` (uuid, pk, default `gen_random_uuid()`)
+- `app_id` (uuid, fk -> apps.id, `ON DELETE CASCADE`)
+- `env` (text) — `dev`/`test`/`prod`，`CHECK (env IN ('dev','test','prod'))`
+- `name` (text) — 团队名称
+- `owner_user_id` (uuid, fk -> auth.users.id, `ON DELETE RESTRICT`) — 团队创始人
+- `status` (text) — `active` | `disabled` | `deleted`，`CHECK (status IN ('active','disabled','deleted'))`
+- `metadata` (jsonb, default '{}')
+- `created_at` (timestamptz, default `now()`)
+- `updated_at` (timestamptz, default `now()`)
+
+```sql
+-- 核心索引
+CREATE INDEX idx_teams_app_env ON teams(app_id, env);
+CREATE INDEX idx_teams_owner ON teams(owner_user_id);
+```
+
+`team_memberships`
+
+- `id` (uuid, pk, default `gen_random_uuid()`)
+- `team_id` (uuid, fk -> teams.id, `ON DELETE CASCADE`)
+- `app_id` (uuid, fk -> apps.id, `ON DELETE CASCADE`) — 冗余字段，便于 RLS 中直接关联 `app_id` + `env`
+- `env` (text) — `dev`/`test`/`prod`，`CHECK (env IN ('dev','test','prod'))`
+- `user_id` (uuid, fk -> auth.users.id, `ON DELETE RESTRICT`) — **禁止级联删除**
+- `role_in_team` (text) — `owner` | `admin` | `member`，`CHECK (role_in_team IN ('owner','admin','member'))`
+- `joined_at` (timestamptz, default `now()`)
+- `status` (text) — `active` | `removed`，`CHECK (status IN ('active','removed'))`
+- `created_at` (timestamptz, default `now()`)
+- unique(`team_id`, `user_id`) — 同一用户在同一团队仅一条成员记录
+
+```sql
+-- 核心索引
+CREATE INDEX idx_team_memberships_user_app_env
+  ON team_memberships(user_id, app_id, env)
+  WHERE status = 'active';
+CREATE INDEX idx_team_memberships_team
+  ON team_memberships(team_id)
+  WHERE status = 'active';
+```
+
+> **说明**：`role_in_team` 按权限从高到低：`owner`（创建者，唯一，可转让）> `admin`（可管理成员、分配席位）> `member`（仅查看和消耗团队资源）。`owner` 和 `admin` 有权分配/撤销团队 VIP 席位。
+
+**删除团队**：通过 `ON DELETE CASCADE` 在 `team_memberships.team_id`、`team_vip_subscriptions.team_id` 上生效。删除 `teams` 行时，数据库自动删除所有成员关联和订阅记录，防止孤儿关联导致越权残留。RLS 策略须绑定「成员存在且团队未软删（`teams.status != 'deleted'`）」。若已启用团队 VIP 订阅，须先解约或与法务对齐后再删除团队（见 VIP 小节「团队解散与 `teams` 外键策略」）。
 
 ### 档位变更审计（纠纷与合规）
 
@@ -1355,6 +1705,28 @@ SELECT count(*) FROM wallet_transactions WHERE app_id = 'app-uuid';
   - 批量结算与对账
   - 管理后台高权限操作（封禁、调账、授予 VIP、**团队席位分配与订阅管理**）
 
+### Edge Function 接口清单
+
+| Edge Function | 方法 | 功能 | 调用方 | 幂等键 |
+|---|---|---|---|---|
+| `join_app` | POST | 用户首次加入应用的初始化（`app_users` + `user_profiles` + 可选预开户） | 客户端 | `app_id` + `user_id` + `env` |
+| `payment_callback` | POST | 支付渠道回调验签，完成充值/购买确认 | 支付渠道 | `biz_no` |
+| `grant_vip` | POST | 管理后台授予个人 VIP（写入 `user_vips` → 调用 `recompute_app_user_tier`） | 管理后台 | `app_id` + `user_id` + `env` + `idempotency_key` |
+| `create_team_subscription` | POST | 创建团队 VIP 订阅（写入 `team_vip_subscriptions`） | 管理后台 | `biz_no` |
+| `assign_team_seat` | POST | 分配团队席位（校验 `seat_limit`、订阅窗口 → 写入 `team_vip_seat_assignments` → 调用 `recompute_app_user_tier`） | 管理后台 / 团队管理员 | `subscription_id` + `user_id` |
+| `revoke_team_seat` | POST | 撤销团队席位 → 调用 `recompute_app_user_tier` | 管理后台 / 团队管理员 | 同上 |
+| `ban_user` / `unban_user` | POST | 封禁/解禁用户（写入 `app_users.app_user_status` → `user_status_logs`） | 管理后台 | `app_id` + `user_id` + `env` |
+| `freeze_balance` | POST | 冻结余额（调用受控 DB 函数） | 业务逻辑 | `biz_no` |
+| `unfreeze_balance` | POST | 解冻余额（调用受控 DB 函数） | 业务逻辑 | `biz_no` |
+| `apply_invoice` | POST | 提交发票申请 | 客户端 | `application_no` |
+| `audit_invoice` | POST | 审核发票申请（通过/驳回） | 管理后台 | `application_no` |
+| `issue_invoice` | POST | 完成开票（调用税控系统） | 管理后台/自动化 | `application_no` |
+| `send_invoice_email` | POST | 发送电子发票邮件 | 管理后台 | `application_no` |
+| `update_tracking` | POST | 更新快递单号 | 管理后台 | `application_no` |
+| `cron_tier_fix` | CRON | 扫描到期档位 → 逐用户调用 `recompute_app_user_tier` | pg_cron 或外部调度 | 自动扫描 |
+
+> **原则**：所有写操作通过 Edge Function + `service_role` 完成；客户端仅读取个人数据。Edge Function 需校验 JWT 中的 `env` 与操作目标 `env` 一致。
+
 ## 管理后台建议菜单
 
 - 应用管理：应用列表、状态管理、应用配置
@@ -1381,27 +1753,115 @@ SELECT count(*) FROM wallet_transactions WHERE app_id = 'app-uuid';
 
 `wallet_transactions`、`user_status_logs`、`user_tier_change_logs` 等流水/审计表会线性增长，需制定归档策略避免存储耗尽。
 
-**推荐方案**：
+**推荐方案：TimescaleDB 自动管理**
 
-| 数据热度 | 保留位置 | 保留时长 | 查询方式 |
-|---------|---------|---------|---------|
-| 热数据 | Postgres 原表 | 90 天 | 直接查询 |
-| 温数据 | Supabase Storage（Parquet/CSV） | 1-2 年 | 下载后分析 |
-| 冷数据 | 外部数仓（如 ClickHouse/BigQuery） | 永久 | 数仓查询 |
-
-**归档实施**：通过 Edge Function + Cron Trigger 定期（如每月 1 日）将历史数据导出到 Storage，然后从原表删除：
+Supabase 支持启用 TimescaleDB 扩展（`CREATE EXTENSION IF NOT EXISTS timescaledb;`），无需额外部署。利用 hypertable 的分区、压缩与保留策略自动管理时序数据生命周期：
 
 ```sql
--- 示例：归档 90 天前的钱包流水
-WITH archived AS (
-  DELETE FROM wallet_transactions
-  WHERE created_at < now() - interval '90 days'
-  RETURNING *
-)
--- 将 archived 结果写入 Storage（通过 Edge Function）
+-- 1. 将 wallet_transactions 转为 hypertable（按 created_at 按天分区）
+SELECT create_hypertable('wallet_transactions', 'created_at',
+  chunk_time_interval => INTERVAL '1 day');
+
+-- 2. 7 天后自动压缩（节省 90%+ 存储）
+ALTER TABLE wallet_transactions SET (
+  timescaledb.compress,
+  timescaledb.compress_segmentby = 'app_id, env',
+  timescaledb.compress_orderby = 'created_at DESC, user_id'
+);
+SELECT add_compression_policy('wallet_transactions', INTERVAL '7 days');
+
+-- 3. 90 天后自动删除（无需 Cron）
+SELECT add_retention_policy('wallet_transactions', INTERVAL '90 days');
 ```
 
-> **注意**：归档脚本必须使用 `service_role` 并在应用层明确指定 `app_id` + `env`，避免误删。归档前应验证数据完整性（行数、金额汇总）。
+| 数据热度 | 存储层 | 说明 |
+|---------|--------|------|
+| 热数据（7 天内） | Hypertable 未压缩 chunk | 写入性能最优，实时查询 |
+| 温数据（7–90 天） | Hypertable 压缩 chunk | 存储大幅缩减，仍可 SQL 查询 |
+| 冷数据（90 天+） | TimescaleDB 自动删除 | 无需外部数仓、无需手动脚本 |
+
+#### 审计日志表（推荐压缩，可选保留）
+
+`user_status_logs` 和 `user_tier_change_logs` 纯追加写入，查询模式是按用户或应用的 `created_at DESC` 时间线，天生适配 hypertable：
+
+```sql
+-- user_status_logs：按天分区，30 天后压缩
+SELECT create_hypertable('user_status_logs', 'created_at',
+  chunk_time_interval => INTERVAL '1 day');
+ALTER TABLE user_status_logs SET (
+  timescaledb.compress,
+  timescaledb.compress_segmentby = 'app_id, user_id',
+  timescaledb.compress_orderby = 'created_at DESC'
+);
+SELECT add_compression_policy('user_status_logs', INTERVAL '30 days');
+
+-- user_tier_change_logs：按天分区，30 天后压缩
+SELECT create_hypertable('user_tier_change_logs', 'created_at',
+  chunk_time_interval => INTERVAL '1 day');
+ALTER TABLE user_tier_change_logs SET (
+  timescaledb.compress,
+  timescaledb.compress_segmentby = 'app_id, env',
+  timescaledb.compress_orderby = 'created_at DESC, user_id'
+);
+SELECT add_compression_policy('user_tier_change_logs', INTERVAL '30 days');
+```
+
+> **审计表的 retention policy 策略**：
+> - 合规要求保留 N 年 → **不设** `add_retention_policy`，仅压缩；存储成本仍远低于未压缩
+> - 非强制保留 → `add_retention_policy(<table>, INTERVAL '365 days');`
+> - 混合方案 → 每年批量导出到 Supabase Storage 为 Parquet，再设置 retention
+
+#### 应用事件/埋点表（最适合 TimescaleDB 的场景）
+
+当应用需要记录用户行为埋点（如 `mygame_player_events`）时，TimescaleDB 的价值最大：
+
+```sql
+-- 示例：玩家行为事件表
+CREATE TABLE mygame_player_events (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  app_id uuid NOT NULL REFERENCES apps(id),
+  env text NOT NULL CHECK (env IN ('dev','test','prod')),
+  user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE RESTRICT,
+  event_type text NOT NULL,       -- 'level_start', 'item_purchase', 'boss_defeat'
+  event_data jsonb DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- 转换为 hypertable（事件表写入量极大，按小时分区）
+SELECT create_hypertable('mygame_player_events', 'created_at',
+  chunk_time_interval => INTERVAL '1 hour');
+
+-- 1 天后压缩（事件数据查询通常只关心近期）
+ALTER TABLE mygame_player_events SET (
+  timescaledb.compress,
+  timescaledb.compress_segmentby = 'app_id, env, event_type',
+  timescaledb.compress_orderby = 'created_at DESC'
+);
+SELECT add_compression_policy('mygame_player_events', INTERVAL '1 day');
+
+-- 30 天后自动删除（跑分析的可提前导出到数仓）
+SELECT add_retention_policy('mygame_player_events', INTERVAL '30 days');
+```
+
+| 特点 | 说明 |
+|------|------|
+| 写入吞吐 | hypertable 按小时分区，写入分散到不同 chunk，无锁竞争 |
+| 压缩比 | `event_data` (jsonb) 压缩比通常 10:1 以上，结合 `event_type` 分段效果更佳 |
+| 查询优化 | `WHERE event_type = ? AND created_at > ?` 自动命中压缩分段 + 时间分区 |
+| 聚合统计 | `time_bucket()` 函数天然适配按小时/天/周的 DAU、留存、漏斗等分析 |
+
+#### 各表策略速查
+
+| 表 | 分区间隔 | 压缩延迟 | 保留策略 | 原因 |
+|---|---------|---------|---------|------|
+| `wallet_transactions` | 1 天 | 7 天 | 90 天 | 高频写入/查询；财务流水不要求永久 |
+| `user_status_logs` | 1 天 | 30 天 | 可选 | 写入频率低；合规审计按需决定是否删除 |
+| `user_tier_change_logs` | 1 天 | 30 天 | 可选 | 同上，纠纷追溯可能需要长期保留 |
+| 应用事件表 | 1 小时 | 1 天 | 30 天 | 写入量极大；事件分析主要看近期；长期数据导出到数仓 |
+
+> **TimescaleDB 与 RLS**：hypertable 与普通表完全兼容 RLS 策略，无需额外配置。压缩后数据仍受 RLS 约束。
+>
+> **连接影响**：TimescaleDB 后台作业（compression/retention）通过 scheduler 执行，不占用用户连接，不影响连接池配额。
 
 ### Rate Limiting 与防刷
 
