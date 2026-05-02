@@ -855,6 +855,128 @@ CREATE POLICY "invoice_apps_admin_all"
 - 开票成功后，应写入 `wallet_transactions` 记录一笔 `direction = 'out'`、`biz_type = 'invoice'` 的交易（如系统收取开票服务费）
 - 或在 `invoice_applications` 中关联原交易 ID，便于对账时追溯资金流向
 
+### 第三方登录集成（OAuth）
+
+基于 Supabase Auth 的 OAuth 能力，支持微信登录、Google 登录等第三方身份提供商。
+
+#### 微信登录（微信开放平台/公众平台）
+
+**适用场景**：
+- 微信开放平台：移动应用、网站应用扫码登录
+- 微信公众平台：公众号网页授权（H5）、小程序登录
+
+**配置**：在 Supabase Dashboard → Authentication → Providers 中添加微信 OAuth：
+
+```json
+{
+  "WECHAT_APP_ID": "wx_xxx",
+  "WECHAT_APP_SECRET": "xxx",
+  "WECHAT_WEB_APP_ID": "wx_web_xxx",
+  "WECHAT_WEB_SECRET": "xxx",
+  "WECHAT_MINI_APP_ID": "wx_mini_xxx",
+  "WECHAT_MINI_SECRET": "xxx"
+}
+```
+
+**登录流程**：
+
+```typescript
+// 1. 调用 Supabase 微信登录（Web/移动应用）
+const { data, error } = await supabase.auth.signInWithOAuth({
+  provider: 'wechat',
+  options: {
+    redirectTo: 'https://yourapp.com/auth/callback',
+    scopes: 'snsapi_userinfo' // 获取用户信息
+  }
+});
+
+// 2. 小程序登录（需配合后端）
+// 小程序调用 wx.login 获取 code，传给 Edge Function
+const { data: session } = await supabase.functions.invoke('wechat_miniprogram_login', {
+  body: { code: wxLoginCode, app_id: 'your_app_uuid' }
+});
+```
+
+**`wechat_miniprogram_login` Edge Function**：
+
+1. 用 `code` + `appid` + `secret` 请求微信 `jscode2session` 接口
+2. 获取 `openid` 和 `unionid`（如有）
+3. 查询 `auth.users` 是否存在该 `provider_id`：
+   - 存在 → 返回会话
+   - 不存在 → 创建新用户 → 调用 `join_app` 初始化应用数据
+4. 返回 JWT 给小程序
+
+**用户绑定字段**：
+
+`app_users.metadata` 可存储：
+- `wechat_openid` — 微信 OpenID（不同应用不同）
+- `wechat_unionid` — 微信 UnionID（同一主体下唯一）
+- `wechat_nickname` — 用户昵称
+- `wechat_avatar` — 头像 URL
+
+#### Google 登录
+
+**配置**：在 Google Cloud Console 创建 OAuth 2.0 客户端：
+
+```json
+{
+  "GOOGLE_CLIENT_ID": "xxx.apps.googleusercontent.com",
+  "GOOGLE_CLIENT_SECRET": "GOCSPX-xxx",
+  "GOOGLE_REDIRECT_URI": "https://yourapp.com/auth/callback"
+}
+```
+
+**登录流程**：
+
+```typescript
+const { data, error } = await supabase.auth.signInWithOAuth({
+  provider: 'google',
+  options: {
+    redirectTo: 'https://yourapp.com/auth/callback',
+    scopes: 'openid email profile',
+    queryParams: {
+      access_type: 'offline',
+      prompt: 'consent'
+    }
+  }
+});
+```
+
+**用户信息同步**：
+
+Google 登录后，`auth.users` 自动填充：
+- `email` — Gmail 地址
+- `user_metadata.full_name` — 用户全名
+- `user_metadata.avatar_url` — Google 头像
+
+如需同步到应用层 `user_profiles`，在 `join_app` Edge Function 中读取 `auth.users.user_metadata` 写入。
+
+#### 多登录方式绑定
+
+同一用户可能通过邮箱、微信、Google 分别注册。建议策略：
+
+1. **首次登录**：创建 `auth.users` + 调用 `join_app` 初始化
+2. **绑定账号**：登录后调用 `supabase.auth.linkIdentity({ provider: 'wechat' })` 关联其他身份
+3. **数据合并**：若检测到同一邮箱的多个账号，提供账号合并流程（需用户确认）
+
+**`user_social_accounts` 表（可选扩展）**：
+
+```sql
+CREATE TABLE user_social_accounts (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  provider text NOT NULL CHECK (provider IN ('wechat', 'google', 'apple')),
+  provider_user_id text NOT NULL, -- 微信 openid / Google sub
+  provider_union_id text, -- 微信 unionid（如有）
+  metadata jsonb DEFAULT '{}',
+  created_at timestamptz DEFAULT now(),
+  UNIQUE(user_id, provider),
+  UNIQUE(provider, provider_user_id)
+);
+```
+
+用于追踪用户的所有关联社交账号，便于解绑/切换。
+
 ## 环境与数据隔离（dev / test / prod）
 
 业务数据除按 **应用（`app_id`）** 隔离外，还需按 **运行环境** 隔离，避免测试或开发数据与生产混读混写。
@@ -1723,6 +1845,10 @@ SELECT count(*) FROM wallet_transactions WHERE app_id = 'app-uuid';
 | `issue_invoice` | POST | 完成开票（调用税控系统） | 管理后台/自动化 | `application_no` |
 | `send_invoice_email` | POST | 发送电子发票邮件 | 管理后台 | `application_no` |
 | `update_tracking` | POST | 更新快递单号 | 管理后台 | `application_no` |
+| `worldfirst_callback` | POST | 万里汇支付回调处理（充值/付款/退款） | 万里汇 | `biz_no` |
+| `worldfirst_refund` | POST | 发起万里汇退款 | 业务系统/管理后台 | `biz_no` |
+| `wechatpay_callback` | POST | 微信支付回调处理（JSAPI/Native/H5） | 微信支付 | `biz_no` |
+| `wechatpay_refund` | POST | 发起微信支付退款 | 业务系统/管理后台 | `biz_no` |
 | `cron_tier_fix` | CRON | 扫描到期档位 → 逐用户调用 `recompute_app_user_tier` | pg_cron 或外部调度 | 自动扫描 |
 
 > **原则**：所有写操作通过 Edge Function + `service_role` 完成；客户端仅读取个人数据。Edge Function 需校验 JWT 中的 `env` 与操作目标 `env` 一致。
