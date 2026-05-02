@@ -28,7 +28,7 @@
 - `id` (uuid, pk)
 - `app_key` (text, unique)
 - `name` (text)
-- `platform` (text) — `ios` | `android` | `web` | `desktop`，建议 `CHECK (platform IN ('ios','android','web','desktop'))`
+- `platform` (text) — `ios` | `android` | `web` | `desktop`，建议 `CHECK (platform IN ('ios','android','web','desktop'))`；若同一产品多端共用一条 `apps` 记录，可将具体端类型放入 `metadata`（如 `{ "clients": ["ios","android"] }`），避免同一 `app_key` 拆多条应用行
 - `status` (text) — `active` | `disabled`，建议 `CHECK (status IN ('active','disabled'))`
 - `metadata` (jsonb, default '{}') — 应用自定义属性（如主题、logo、描述、扩展配置等），各应用可自由定义内部结构
 - `ext_schema_prefix` (text, nullable) — 扩展表命名前缀，如 `myapp`；应用特有业务表建议以此为前缀（如 `myapp_player_levels`），便于识别和管理
@@ -46,7 +46,7 @@
 - `env` (text) — `dev` | `test` | `prod`，建议 `CHECK (env IN ('dev','test','prod'))`
 - `user_tier` (text) — `basic` | `paid` | `team`，建议 `CHECK (user_tier IN ('basic','paid','team'))`
 - `tier_expires_at` (timestamptz, nullable) — 付费/团队等档位的到期时刻；到期后应在库内降级（见「关键安全原则」），RLS 须结合该字段判断**有效档位**，避免永久授权
-- `app_user_status` (text) — `active` | `banned`，建议 `CHECK (app_user_status IN ('active','banned'))`
+- `app_user_status` (text) — `active` | `banned` | `deleted`（按应用注销流程的**软删除**，与「关键安全原则」一致），建议 `CHECK (app_user_status IN ('active','banned','deleted'))`
 - `metadata` (jsonb, default '{}') — 用户在该应用下的扩展数据（如游戏进度、应用内偏好、自定义字段等），结构由应用自行约定
 - `created_at` (timestamptz)
 - unique(`app_id`, `user_id`, `env`)
@@ -60,7 +60,9 @@
 ```sql
 -- 应用用户查询（RLS 核心）
 CREATE INDEX idx_app_users_user_app_env ON app_users(user_id, app_id, env);
-CREATE INDEX idx_app_users_tier_expires ON app_users(tier_expires_at) WHERE user_tier IN ('paid','team');
+-- 定时任务扫描「将到期/已到期」档位时，可仅索引需处理行（按需调整谓词）
+CREATE INDEX idx_app_users_tier_expires ON app_users(tier_expires_at)
+  WHERE user_tier IN ('paid','team') AND tier_expires_at IS NOT NULL;
 
 -- 用户资料
 CREATE INDEX idx_user_profiles_user_app_env ON user_profiles(user_id, app_id, env);
@@ -167,11 +169,14 @@ AS $$
   FROM app_users au
   WHERE au.app_id = p_app_id
     AND au.env = p_env
-    AND au.user_id = p_user_id;
+    AND au.user_id = p_user_id
+    AND au.app_user_status = 'active';
 $$;
 ```
 
 > **注意**：`SECURITY DEFINER` 函数必须显式 `SET search_path = public`，防止 search_path 注入攻击（恶意用户通过同名表劫持函数）。所有置于私有 schema 的受控函数均应遵循此规范。
+>
+> **非 active 成员**：`banned` / `deleted` 不满足上述 `WHERE`，函数返回 **NULL**（调用方勿把 NULL 当成 `basic`）；RLS 与档位判断应以「成员存在且 `active`」为前提。
 
 ## 应用元数据与扩展
 
@@ -266,7 +271,7 @@ CREATE POLICY "mygame_player_levels_self_access"
     AND env = (auth.jwt()->'app_metadata'->>'env')
   );
 
--- 策略 2：管理员可按应用查询（通过 RBAC 校验）
+-- 策略 2：管理员可按应用查询（RBAC；生产建议链到 permissions，见「管理员 RLS 与 permissions」）
 CREATE POLICY "mygame_player_levels_admin_access"
   ON mygame_player_levels
   FOR ALL
@@ -306,7 +311,7 @@ CREATE POLICY "{table}_user_access"
     )
   );
 
--- 通用管理员策略（可选）
+-- 通用管理员策略（可选；上线前改为 EXISTS → permissions，见 RBAC 小节）
 CREATE POLICY "{table}_admin_access"
   ON {table}
   FOR ALL
@@ -434,6 +439,12 @@ RLS 需要知道「当前会话要访问哪一套环境的数据」。推荐：
 - 或使用 Supabase 文档推荐的 `auth.jwt()` 解析方式（以当前项目 Supabase/Postgres 版本文档为准）
 
 客户端连接 **开发/测试/生产** 时应使用对应环境的 **Anon Key + URL**；若多环境共库，还需保证 JWT 中 `env` 与建连意图一致。
+
+**JWT 中如何出现 `app_metadata.env`（及可选的 `tier` / `app_id`）**
+
+- 默认签发流程**不会**自动把业务字段写入 JWT；须在 **Auth 侧**显式注入，例如 Supabase 的 **Custom Access Token Hook**（或同版本文档中的等价钩子），在 token 签发/刷新时读取库内事实后写入 **`app_metadata`**（`env`、`tier`、当前 `app_id` 等）。
+- 多应用同会话：若同一用户需在短时间在多个 `app_id` 上下文切换，应在**换端/换应用**时刷新会话或通过单独入口签发**仅绑定该应用**的声明，避免 RLS 依赖的 `env`/`app_id` 与连接意图不一致。
+- 文档中凡使用 `auth.jwt()->'app_metadata'->>...` 的策略，均以「上述钩子或服务端已同步 `auth.users.app_metadata`」为前提；否则应 **拒绝**（缺少 `env` 等）或改为不依赖 JWT 的路径（不推荐双轨混用）。
 
 ### RLS 隔离规则（应用 + 环境）
 
@@ -592,6 +603,16 @@ BEGIN
   FROM wallet_accounts
   WHERE id = p_account_id
   FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'wallet account not found';
+  END IF;
+
+  -- 调用方校验：service_role / Edge 调用时 auth.uid() 多为 null，可跳过；
+  -- 若对 authenticated 开放 EXECUTE，则必须校验账户归属（见下文「SECURITY DEFINER 与 EXECUTE」）
+  IF auth.uid() IS NOT NULL AND v_user_id <> auth.uid() THEN
+    RAISE EXCEPTION 'forbidden';
+  END IF;
   
   -- 2. 原子扣减（若余额不足则返回 0 行）
   UPDATE wallet_accounts
@@ -622,6 +643,10 @@ $$;
 
 > **事务安全说明**：上述函数在单一事务内执行。若第 3 步（写流水）因任何原因失败，第 2 步（扣余额）会自动回滚，避免**余额已扣但无流水**的不一致状态。外部调用者应始终通过 `BEGIN ... COMMIT` 包裹此函数调用。
 
+> **SECURITY DEFINER 与 EXECUTE**：`SECURITY DEFINER` 函数以定义者权限执行，**禁止**默认对 `PUBLIC`/`authenticated` 随意开放 `EXECUTE`。推荐：`REVOKE ALL ON FUNCTION deduct_balance(...) FROM PUBLIC;`，仅 `GRANT EXECUTE` 给 **`service_role`**（由 Edge Function 调用），或由仅具高权限角色的后台用户执行。若业务上必须由终端用户直连调用，则函数内须强制 `auth.uid()` 与账户 `user_id` 一致（如上），并仍需最小化授予对象。
+>
+> **`biz_no` 与 INSERT 幂等**：`unique(app_id, env, biz_no)` 下，**重复请求**会因唯一约束报错。幂等语义应在函数内 **先按 `app_id, env, biz_no` 查询 `wallet_transactions`**：若已有 `success` 流水则直接返回成功（不再动余额）；或与 `INSERT ... ON CONFLICT DO NOTHING` + 回填结果配合。原则是「同一业务单号多次提交**不发生重复扣款/入账**」，与「禁止伪造新单号重复刷」并行。
+
 **方案 B：应用层乐观锁**
 
 `wallet_accounts` 增加 `version` (int) 字段，更新时 `WHERE version = old_version`。
@@ -632,7 +657,7 @@ $$;
 
 - 账务只追加流水，不直接改历史记录
 - 余额变更通过数据库函数或事务统一处理
-- `biz_no` 必须保证幂等（同一 `app_id+env+biz_no` 不可重复入账/出账）
+- `biz_no`：**业务侧**单号全局唯一（`app_id+env+biz_no`）；库内靠唯一约束防重。**接口幂等**需在函数/Edge 层实现「已存在成功流水则短路返回」，避免客户端重试时收到唯一约束错误却状态不明
 - 对账任务建议通过 Edge Functions + Cron 触发
 - **points（积分）精度**：`wallet_accounts.available_balance numeric(18,2)` 对积分类型保留两位小数，但积分通常为整数。建议通过 CHECK 约束保证积分无小数位：
 
@@ -715,6 +740,7 @@ $$;
      WHERE au.app_id = <table>.app_id
        AND au.env = <table>.env
        AND au.user_id = auth.uid()
+       AND au.app_user_status = 'active'
        AND (
          au.user_tier = 'basic'
          OR (
@@ -724,6 +750,8 @@ $$;
        )
    )
    ```
+
+   `banned` / `deleted` 成员应被上述条件排除；若策略未带 `app_user_status`，封禁或软删用户仍可能满足其他谓词造成越权，**须统一约束**。
 
 2. **定时补偿修正（第二道防线）**
    使用 **pg_cron**（Supabase 支持）或 **Edge Function + Cron Trigger**，定期扫描过期记录并修正：
@@ -752,6 +780,7 @@ $$;
      p_user_id uuid
    ) RETURNS text
    LANGUAGE sql STABLE SECURITY DEFINER
+   SET search_path = public
    AS $$
      SELECT CASE
        WHEN au.user_tier IN ('paid','team')
@@ -762,9 +791,12 @@ $$;
      FROM app_users au
      WHERE au.app_id = p_app_id
        AND au.env = p_env
-       AND au.user_id = p_user_id;
+       AND au.user_id = p_user_id
+       AND au.app_user_status = 'active';
    $$;
    ```
+
+   与上文「数据库基础设施函数」中的 `effective_user_tier` 定义须**保持一致**（含 `SET search_path`、是否排除非 `active` 成员）；以 migrations 中单一源为准。
 
 ### 与 RLS 的配合方式（核心）
 
@@ -778,7 +810,7 @@ $$;
    - 策略中：`coalesce((auth.jwt()->'app_metadata'->>'tier'), '')` 与库表一致时使用；或 **仅以 claims 做第一层过滤，最终以 `app_users` 校验防篡改**。
    - 支付/升降级后：更新 `app_users.user_tier`，并通过 Admin API 更新 `app_metadata`，促使用户下次 JWT 携带新档位。
 
-管理员（RBAC）绕开终端档位限制时，仍须满足 `user_roles` + `app_id` + `env`，避免与普通用户策略混淆。
+管理员（RBAC）绕开终端档位限制时，仍须满足 **`user_roles` +（推荐）`permissions`** + **`app_id` + `env`**，避免与普通用户策略混淆。
 
 ### 团队数据模型与级联（删除团队时清理成员）
 
@@ -840,7 +872,7 @@ $$;
 | 目的 | 基础/付费/团队能访问的功能与数据 | 谁能管理用户、财务、VIP、配置 |
 | 权威数据 | `app_users.user_tier` + 业务表 | `user_roles`、`roles`、`permissions` |
 | JWT | 可选：`app_metadata` 镜像档位、环境 | 可选：`app_metadata` 中的管理员标记 **仅作提示**，RLS 仍以表为准 |
-| RLS | `tier` + `app_id` + `env` + 资源条件 | `exists(user_roles...)` + 同上租户隔离 |
+| RLS | `tier` + `app_id` + `env` + 资源条件 | `exists(user_roles → permissions...)` + 同上租户隔离 |
 
 **原则**：RLS 表达式尽量 **引用数据库中的成员与权限事实**；JWT claims 用于减少 join 或分层策略时，须与表数据一致性或明确「表优先」。
 
@@ -883,48 +915,69 @@ $$;
 - 后端：Edge Functions 或 SQL 函数内强制校验权限与档位
 - 数据层：**RLS 为核心** — 按 `app_id` + **`env`** + **用户级别（`app_users.user_tier`）** + **RBAC（管理员）** + 资源归属联合判定
 
+### 管理员 RLS 与 permissions（推荐）
+
+前文模板中「仅 `EXISTS user_roles + roles`」便于理解与原型验证；**生产环境**应将管理员策略 **关联到 `permissions.code`**（或等价能力模型），避免任意被授予角色的账号访问财务、封禁等高危操作：
+
+```sql
+-- 示例：当前用户对目标行所属 app/env 拥有权限码 user.read（按需替换 code）
+EXISTS (
+  SELECT 1
+  FROM user_roles ur
+  JOIN role_permissions rp ON rp.role_id = ur.role_id
+  JOIN permissions perm ON perm.id = rp.permission_id
+  WHERE ur.user_id = auth.uid()
+    AND ur.app_id = <table>.app_id
+    AND ur.env = <table>.env
+    AND perm.code = 'user.read'
+)
+```
+
+可对 **`roles.code = 'super_admin'`** 等保留短路分支（仍需写入审计）；若团队倾向集中管控，也可让**全部管理写路径**仅通过 **Edge Function + service_role**，Edge 内校验运营 JWT 与权限表后再写入，数据库侧对 `authenticated` **不开放**管理员类策略——二者择一或组合，须在评审中固化。
+
 ### 灵活策略示例（思路）
 
-- **按档位可读**：仅「有效」`paid`/`team` 可读 —— `exists (... app_users au ... and <有效档位条件含 tier_expires_at>)`，勿省略过期判断
+- **按档位可读**：仅「有效」`paid`/`team` 可读 —— `exists (... app_users au ... au.app_user_status = 'active' and <有效档位条件含 tier_expires_at>)`，勿省略过期判断
 - **团队资源**：行带 `team_id`，策略要求 `exists (team_memberships where user_id = auth.uid() and team_id = row.team_id)` 且档位为 `team`
-- **Claims 辅助**：`auth.jwt()->'app_metadata'->>'tier' = 'paid'` **且** `exists (app_users ... user_tier = 'paid')`，双因子防止 JWT 与库不一致时的越权
+- **Claims 辅助**：`auth.jwt()->'app_metadata'->>'tier' = 'paid'` **且** `exists (app_users ... user_tier = 'paid' and app_user_status = 'active')`，双因子防止 JWT 与库不一致时的越权
 
 ## RLS 安全设计（关键）
 
 所有暴露给客户端访问的业务表默认开启 RLS，并至少遵循：
 
 1. **会话环境匹配**：行数据的 `env` 必须与 JWT（推荐 `app_metadata.env`）一致；缺失或非法 `env` 一律拒绝
-2. 用户只能访问自己所属应用与环境下的成员关系（`app_users`：`app_id` + `env`）
+2. 终端用户须在 `app_users` 上具备 **`app_user_status = 'active'`** 的成员关系（`app_id` + `env`）；`banned` / `deleted` 默认拒绝访问业务数据（管理员路径除外）
 3. **用户级别**：受档位控制的资源，必须以库内 **`app_users` 的有效档位**（含 **`tier_expires_at` 与当前时间比较**）及必要的团队/订阅表为满足条件；**不信任前端 tier**；自定义 claims 仅作辅助，且 **不以 `user_metadata` 为授权依据**
 4. 普通用户只能访问**自己所属应用**下的用户资料、钱包、VIP 数据（`app_id` 与 `env` 均须一致）；团队场景扩展为「本人或本团队成员」
-5. 管理员角色可按权限访问 **同一应用、同一环境** 内的数据（`user_roles`）
+5. 管理员路径：`user_roles` + **`role_permissions` → `permissions.code`**（或与 Edge/service_role 路径二选一）；仍须 **`app_id` + `env`** 与 JWT 一致
 6. 财务相关写操作必须通过受控函数执行
 
 示例（思路）：
 
-- `using (exists (select 1 from app_users au where au.app_id = <table>.app_id and au.env = <table>.env and au.user_id = auth.uid()))`
+- `using (exists (select 1 from app_users au where au.app_id = <table>.app_id and au.env = <table>.env and au.user_id = auth.uid() and au.app_user_status = 'active'))`
 - 并与 `auth.jwt()` 中解析出的 `env` 做交叉校验，避免仅依赖表内列被篡改的假设（插入/更新策略需约束 `env` 不可改为与 JWT 不一致的值）
-- 需要档位时：在上述 `exists` 中增加有效档位谓词（**含 `tier_expires_at`**），或与独立 `tier_requirements` 映射表关联；可选封装 `security definer` 函数 `effective_user_tier(app_id, env, uid)` 供策略复用（函数置于私有 schema，内部仍只读表）
+- 需要档位时：在上述 `exists` 中增加有效档位谓词（**含 `tier_expires_at`**），或与独立 `tier_requirements` 映射表关联；可选封装 `security definer` 函数 `effective_user_tier(app_id, env, uid)`（仅统计 **`active`** 成员；非 active 返回 NULL）供策略复用（函数置于私有 schema，内部仍只读表）
 
 ### Realtime 订阅安全
 
 Supabase Realtime 的 `postgres_changes` 监听与 Postgres RLS **是两套独立机制**。在启用 Realtime 推送时，必须额外约束订阅范围：
 
-- **客户端订阅**必须绑定 `user_id = auth.uid()` 与 `env` 过滤，禁止全表监听：
+- **客户端订阅**须在服务端允许的过滤维度内**尽量收窄**：至少 `user_id=eq.${auth.uid()}`；若 **单库多 `env`** 且 Realtime filter 支持组合条件，应叠加 **`env=eq.${sessionEnv}`**（列须存在）；禁止依赖「仅靠客户端筛选」的全表或大粒度 topic。
+- **`postgres_changes` filter** 语法因 SDK/版本而异；无法组合过滤时，**必须以 RLS** 收紧可见行（见下），且 UI 侧仍应避免订阅过宽。
 
   ```javascript
-  // 正确示例
+  // 示例：至少按用户收窄（若能过滤 env，请追加 env=eq....）
   supabase.channel('wallet')
     .on('postgres_changes', {
       event: 'INSERT',
       schema: 'public',
       table: 'wallet_transactions',
-      filter: `user_id=eq.${currentUserId}` // 必须显式过滤
+      filter: `user_id=eq.${currentUserId}`
     }, callback)
     .subscribe();
   ```
 
-- **RLS 补充**：即使 Realtime 侧过滤正确，Postgres 侧的 RLS 仍必须生效（Realtime 会使用 RLS 做行级过滤）。确保 `wallet_transactions` 等表的 RLS `SELECT` 策略已限制 `user_id = auth.uid()`。
+- **RLS 补充**：即使 Realtime 侧过滤正确，Postgres 侧的 RLS 仍必须生效（Realtime 会使用 RLS 做行级过滤）。确保 `wallet_transactions` 等表的 RLS `SELECT` 策略已限制 `user_id = auth.uid()` **且 `env` 与会话一致**（单库多环境时尤为关键）。
 - **避免敏感字段泄露**：Realtime 推送会携带整行数据，确保业务表中不含明文密码、密钥等敏感列。
 
 ### RLS 策略测试规范
@@ -965,6 +1018,7 @@ SELECT count(*) FROM wallet_transactions WHERE app_id = 'app-uuid';
 | 普通用户 | 查询其他环境的数据 | 返回空结果 |
 | 管理员 | 查询应用内所有数据 | 返回数据（需 RBAC 校验） |
 | 已封禁用户 | 查询任何数据 | 返回空结果（`app_user_status = 'banned'`） |
+| 已软删用户 | 查询终端业务数据 | 返回空结果（`app_user_status = 'deleted'`） |
 
 > 建议在 CI/CD 流程中集成 RLS 测试，每次 migrations 变更后自动运行。
 
