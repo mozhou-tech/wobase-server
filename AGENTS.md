@@ -155,6 +155,169 @@ CREATE INDEX idx_app_user_metadata_key ON app_user_metadata(meta_key);
 - **必须开启 RLS**：所有应用特有业务表默认开启 RLS，策略需约束 `app_id` + `env` + 资源归属
 - **禁止**：动态创建表（如通过客户端请求建表）；所有 schema 变更应通过 **Supabase CLI migrations** 管理
 
+### 应用业务表创建指南
+
+#### 1) 应用注册流程（分配命名空间）
+
+在创建业务表之前，先在 `apps` 表中注册应用并分配扩展前缀：
+
+```sql
+INSERT INTO apps (app_key, name, platform, status, ext_schema_prefix)
+VALUES ('mygame', '我的游戏', 'ios', 'active', 'mygame');
+```
+
+> **命名空间冲突避免**：`ext_schema_prefix` 必须全局唯一。建议在注册应用时通过数据库 `UNIQUE` 约束或应用层校验确保前缀不重复。
+
+#### 2) 迁移脚本模板
+
+每个应用的业务表应存放在独立的迁移脚本中，文件命名规范：`{timestamp}_{app_prefix}_{entity}.sql`
+
+示例：`20240115_mygame_player_levels.sql`
+
+```sql
+-- ============================================
+-- 应用：mygame
+-- 表：mygame_player_levels（玩家关卡进度）
+-- ============================================
+
+CREATE TABLE mygame_player_levels (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  app_id uuid NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+  env text NOT NULL CHECK (env IN ('dev', 'test', 'prod')),
+  user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  level_id int NOT NULL,
+  score int NOT NULL DEFAULT 0,
+  stars int NOT NULL DEFAULT 0 CHECK (stars >= 0 AND stars <= 3),
+  completed_at timestamptz,
+  metadata jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  
+  -- 同一用户在同一应用同一环境下，同一关卡只有一条记录
+  UNIQUE(app_id, env, user_id, level_id)
+);
+
+-- 必要索引
+CREATE INDEX idx_mygame_player_levels_user_app_env 
+  ON mygame_player_levels(user_id, app_id, env);
+CREATE INDEX idx_mygame_player_levels_level 
+  ON mygame_player_levels(app_id, env, level_id);
+
+-- 更新时间戳触发器（可选）
+CREATE TRIGGER update_mygame_player_levels_updated_at
+  BEFORE UPDATE ON mygame_player_levels
+  FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- 启用 RLS
+ALTER TABLE mygame_player_levels ENABLE ROW LEVEL SECURITY;
+
+-- 策略 1：用户只能读写自己的记录（且 env 匹配）
+CREATE POLICY "mygame_player_levels_self_access"
+  ON mygame_player_levels
+  FOR ALL
+  USING (
+    user_id = auth.uid()
+    AND env = (auth.jwt()->'app_metadata'->>'env')
+  )
+  WITH CHECK (
+    user_id = auth.uid()
+    AND env = (auth.jwt()->'app_metadata'->>'env')
+  );
+
+-- 策略 2：管理员可按应用查询（通过 RBAC 校验）
+CREATE POLICY "mygame_player_levels_admin_access"
+  ON mygame_player_levels
+  FOR ALL
+  USING (
+    env = (auth.jwt()->'app_metadata'->>'env')
+    AND EXISTS (
+      SELECT 1 FROM user_roles ur
+      JOIN roles r ON ur.role_id = r.id
+      WHERE ur.user_id = auth.uid()
+        AND ur.app_id = mygame_player_levels.app_id
+        AND ur.env = mygame_player_levels.env
+    )
+  );
+```
+
+#### 3) RLS 策略规范（应用业务表通用模板）
+
+所有应用业务表的 RLS 策略应遵循以下模板：
+
+```sql
+-- 通用用户策略（必须）
+CREATE POLICY "{table}_user_access"
+  ON {table}
+  FOR ALL
+  USING (
+    -- 资源归属校验
+    user_id = auth.uid()
+    -- 环境隔离
+    AND env = (auth.jwt()->'app_metadata'->>'env')
+    -- 应用成员关系校验（可选，增加安全性）
+    AND EXISTS (
+      SELECT 1 FROM app_users au
+      WHERE au.app_id = {table}.app_id
+        AND au.env = {table}.env
+        AND au.user_id = auth.uid()
+        AND au.app_user_status = 'active'
+    )
+  );
+
+-- 通用管理员策略（可选）
+CREATE POLICY "{table}_admin_access"
+  ON {table}
+  FOR ALL
+  USING (
+    env = (auth.jwt()->'app_metadata'->>'env')
+    AND EXISTS (
+      SELECT 1 FROM user_roles ur
+      JOIN roles r ON ur.role_id = r.id
+      WHERE ur.user_id = auth.uid()
+        AND ur.app_id = {table}.app_id
+        AND ur.env = {table}.env
+    )
+  );
+```
+
+#### 4) 应用层对接规范
+
+客户端调用时应始终携带当前应用标识，推荐方式：
+
+```javascript
+// 客户端初始化时绑定应用
+const supabase = createClient(url, anonKey, {
+  db: {
+    schema: 'public'
+  },
+  global: {
+    headers: {
+      'x-app-id': 'mygame-uuid',      // 应用 ID
+      'x-env': 'prod'                 // 当前环境
+    }
+  }
+});
+
+// 查询本应用的业务数据（RLS 自动过滤）
+const { data } = await supabase
+  .from('mygame_player_levels')
+  .select('*')
+  .eq('level_id', 1);
+```
+
+> **注意**：虽然可通过 HTTP Header 传递 `app_id`，但 RLS 策略中**不应直接信任 Header**，仍应以 JWT 中的 `app_metadata` 或 `auth.uid()` 关联的 `app_users` 记录为准，防止伪造。
+
+#### 5) 命名空间管理清单
+
+建议在项目中维护以下清单，避免表名冲突：
+
+| 应用 | `app_key` | `ext_schema_prefix` | 扩展表清单 |
+|------|----------|---------------------|-----------|
+| 我的游戏 | `mygame` | `mygame` | `mygame_player_levels`, `mygame_achievements` |
+| 我的商城 | `myshop` | `myshop` | `myshop_products`, `myshop_orders` |
+
+> 冲突解决：若两个应用申请相同前缀，以先注册者为准。前缀一旦分配，即使应用下线也不应回收重用（避免历史数据混淆）。
+
 ### 元数据扩展的选型建议
 
 - **jsonb 字段（`apps.metadata`、`app_users.metadata`）**：
