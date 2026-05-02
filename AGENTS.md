@@ -20,6 +20,111 @@
 - Supabase Edge Functions：支付回调、账务结算、异步任务入口
 - RLS（Row Level Security）：多租户与权限隔离的核心机制
 
+## 技术栈（前端）
+
+- **React 18+**：核心 UI 框架，函数组件 + Hooks 模式
+- **TypeScript 5+**：全类型覆盖，严格模式 (`strict: true`)
+- **Ant Design (antd) 5+**：企业级 UI 组件库，主题定制通过 `ConfigProvider`
+- **Tailwind CSS 3+**：原子化 CSS 工具类，与 antd 互补处理布局/间距/响应式
+- **React Query (TanStack Query)**：服务端状态管理，缓存、重试、后台刷新
+- **Zustand / Jotai**：客户端全局状态（轻量，替代 Redux）
+- **React Router 6+**：路由管理，支持嵌套路由 + Loader/Action 模式
+
+### 前端技术约束
+
+#### UI 组件规范
+
+| 场景 | 推荐方案 | 禁止 |
+|------|---------|------|
+| 表单输入 | Ant Design `Form` + `Input`/`Select`/`DatePicker` | 原生 HTML 表单无封装 |
+| 数据表格 | Ant Design `Table` | 原生 table 或第三方表格库 |
+| 弹窗/抽屉 | Ant Design `Modal`/`Drawer` | 自实现弹窗层 |
+| 布局/间距/响应式 | Tailwind CSS (`flex`, `grid`, `p-4`, `md:w-1/2`) | 内联样式 `style={{}}` |
+| 图标 | Ant Design Icons (`@ant-design/icons`) | 引入多个图标库混用 |
+| 主题定制 | `ConfigProvider` + `theme` 配置 | 直接覆盖 antd less 变量 |
+
+#### 状态管理分层
+
+```
+服务端状态 (React Query)          客户端状态 (Zustand/Jotai)
+├── 用户数据、VIP 信息              ├── UI 状态（侧边栏展开、主题模式）
+├── 钱包余额、交易流水              ├── 表单临时数据
+├── 团队/成员列表                   └── 全局通知
+└── 应用配置（不常变）
+```
+
+#### 与 Supabase 交互规范
+
+```typescript
+// ✅ 推荐：封装 hooks
+function useWalletBalance(appId: string, env: string) {
+  const { data, error, isLoading } = useQuery({
+    queryKey: ['wallet', appId, env],
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from('wallet_accounts')
+        .select('*')
+        .eq('app_id', appId)
+        .eq('env', env)
+        .single();
+      if (error) throw error;
+      return data;
+    },
+    staleTime: 30000, // 30秒内不重新请求
+  });
+  return { balance: data?.available_balance, error, isLoading };
+}
+
+// ❌ 禁止：随处直接调用 supabase，无缓存无错误处理
+const { data } = await supabase.from('wallet_accounts').select('*');
+```
+
+#### RLS 配合前端
+
+- 所有查询**不带 `user_id` 过滤**，依赖 RLS 自动过滤
+- 订阅 Realtime 时**必须**叠加 `user_id=eq.${uid}` 过滤条件
+- JWT 中 `env` 缺失时，前端应阻止请求并提示重新登录
+
+#### 登录方式适配
+
+根据 `apps.login_methods` 动态渲染登录选项：
+
+```typescript
+function LoginMethods({ appConfig }: { appConfig: AppConfig }) {
+  const methods = appConfig.login_methods || ['email'];
+  
+  return (
+    <Space direction="vertical" className="w-full">
+      {methods.includes('email') && <EmailLoginForm />}
+      {methods.includes('phone_otp') && <PhoneOtpLoginForm />}
+      {methods.includes('wechat') && <WechatLoginButton />}
+      {methods.includes('google') && <GoogleLoginButton />}
+    </Space>
+  );
+}
+```
+
+#### 目录结构建议
+
+```
+src/
+├── components/          # 通用组件（基于 antd）
+│   ├── Form/
+│   ├── Table/
+│   └── Layout/
+├── features/            # 业务模块
+│   ├── auth/
+│   ├── wallet/
+│   ├── vip/
+│   └── team/
+├── hooks/               # 通用 hooks（Supabase 封装）
+├── stores/              # Zustand/Jotai stores
+├── lib/
+│   ├── supabase.ts      # Supabase client 配置
+│   └── queryClient.ts   # React Query 配置
+└── types/               # TypeScript 类型定义
+```
+
 ## 多应用（Multi-App）架构
 
 ### 1) 应用主表
@@ -33,6 +138,7 @@
 - `status` (text) — `active` | `disabled`，建议 `CHECK (status IN ('active','disabled'))`
 - `metadata` (jsonb, default '{}') — 应用自定义属性（如主题、logo、描述、扩展配置等），各应用可自由定义内部结构
 - `ext_schema_prefix` (text, nullable) — 扩展表命名前缀，如 `myapp`；应用特有业务表建议以此为前缀（如 `myapp_player_levels`），便于识别和管理
+- `login_methods` (text[]) — 允许的登录方式数组，如 `{'email', 'phone_otp', 'wechat', 'google'}`，应用可按需组合，建议 `CHECK (login_methods <@ ARRAY['email', 'phone_otp', 'wechat', 'google', 'apple'])`
 - `created_at` (timestamptz)
 
 > 外键级联策略：`apps` 作为根表，通常不允许直接删除（避免级联误删全量业务数据）。若需下线应用，建议标记 `status = 'disabled'`。
@@ -1849,6 +1955,10 @@ SELECT count(*) FROM wallet_transactions WHERE app_id = 'app-uuid';
 | `worldfirst_refund` | POST | 发起万里汇退款 | 业务系统/管理后台 | `biz_no` |
 | `wechatpay_callback` | POST | 微信支付回调处理（JSAPI/Native/H5） | 微信支付 | `biz_no` |
 | `wechatpay_refund` | POST | 发起微信支付退款 | 业务系统/管理后台 | `biz_no` |
+| `send_sms_code` | POST | 发送手机验证码（需校验 `apps.login_methods` 包含 `phone_otp`） | 客户端 | `phone` + `app_id` + `env` |
+| `verify_sms_code` | POST | 验证手机验证码并登录/注册 | 客户端 | `phone` + `code` + `app_id` + `env` |
+| `link_phone` | POST | 已登录用户绑定手机号 | 客户端 | `phone` + `user_id` |
+| `unlink_phone` | POST | 解绑手机号（需保留至少一种登录方式） | 客户端 | `user_id` |
 | `cron_tier_fix` | CRON | 扫描到期档位 → 逐用户调用 `recompute_app_user_tier` | pg_cron 或外部调度 | 自动扫描 |
 
 > **原则**：所有写操作通过 Edge Function + `service_role` 完成；客户端仅读取个人数据。Edge Function 需校验 JWT 中的 `env` 与操作目标 `env` 一致。
