@@ -459,21 +459,8 @@ CREATE TRIGGER update_teams_updated_at
   BEFORE UPDATE ON teams
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
--- RLS
+-- RLS（策略在 team_memberships 创建后添加，见下方）
 ALTER TABLE teams ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY "teams_member_access"
-  ON teams
-  FOR ALL
-  USING (
-    EXISTS (
-      SELECT 1 FROM team_memberships tm
-      WHERE tm.team_id = teams.id
-        AND tm.user_id = auth.uid()
-        AND tm.status = 'active'
-    )
-    OR owner_user_id = auth.uid()
-  );
 
 COMMENT ON TABLE teams IS '团队表';
 
@@ -514,6 +501,20 @@ CREATE POLICY "team_memberships_self_access"
     )
   )
   WITH CHECK (user_id = auth.uid());
+
+-- teams 表的 RLS 策略（依赖 team_memberships，必须在 team_memberships 创建后添加）
+CREATE POLICY "teams_member_access"
+  ON teams
+  FOR ALL
+  USING (
+    EXISTS (
+      SELECT 1 FROM team_memberships tm
+      WHERE tm.team_id = teams.id
+        AND tm.user_id = auth.uid()
+        AND tm.status = 'active'
+    )
+    OR owner_user_id = auth.uid()
+  );
 
 COMMENT ON TABLE team_memberships IS '团队成员表';
 
