@@ -5,10 +5,10 @@ import { NextRequest, NextResponse } from 'next/server';
  * 由 Vercel Cron 触发
  *
  * 配置在 vercel.json 中：
- * "crons": [
+ * crons: [
  *   {
- *     "path": "/api/cron/tier-downgrade",
- *     "schedule": "*/5 * * * *"
+ *     path: "/api/cron/tier-downgrade",
+ *     schedule: "每5分钟"
  *   }
  * ]
  */

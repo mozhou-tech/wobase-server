@@ -1,7 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   experimental: {
-    typedRoutes: true,
+    // typedRoutes: true,
   },
   images: {
     domains: [
@@ -24,10 +24,14 @@ const nextConfig = {
   },
   // 重写规则（如需 API 代理）
   async rewrites() {
+    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    if (!supabaseUrl) {
+      return [];
+    }
     return [
       {
         source: '/api/supabase/:path*',
-        destination: `${process.env.NEXT_PUBLIC_SUPABASE_URL}/:path*`,
+        destination: `${supabaseUrl}/:path*`,
       },
     ];
   },
